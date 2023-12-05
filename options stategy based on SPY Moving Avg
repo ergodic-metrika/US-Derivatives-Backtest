@@ -1,0 +1,180 @@
+import numpy as np
+import yfinance as yf
+from datetime import datetime, timedelta
+import pandas as pd
+from scipy.stats import norm
+import math
+import matplotlib.pyplot as plt
+
+# Function to calculate the Black-Scholes option price
+def black_scholes(S, K, T, r, sigma, option_type='call'):
+    # Calculate d1 and d2
+    d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+
+    # Calculate the option price
+    if option_type == 'call':
+        option_price = (S * norm.cdf(d1) - K * math.exp(-r * T) * norm.cdf(d2))
+    elif option_type == 'put':
+        option_price = (K * math.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1))
+    else:
+        raise ValueError("Invalid option type. Use 'call' or 'put'.")
+
+    return option_price
+
+# Function to calculate moving averages
+def calculate_moving_averages(df, short_window, long_window):
+    df['5_MA'] = df['Close'].rolling(window=short_window).mean()
+    df['20_MA'] = df['Close'].rolling(window=long_window).mean()
+
+# Function to determine the expiration date
+def determine_expiration_date(ticker, min_days_to_expiration=30):
+    current_date = datetime.now()
+    all_expirations = ticker.options
+    all_expirations = [datetime.strptime(exp, '%Y-%m-%d') for exp in all_expirations]
+    valid_expirations = [exp for exp in all_expirations if exp > (current_date + timedelta(days=min_days_to_expiration))]
+    if not valid_expirations:
+        raise ValueError("No valid expiration dates found")
+    nearest_valid_expiration = min(valid_expirations)
+    return nearest_valid_expiration.strftime('%Y-%m-%d')
+
+# Function to find the closest strike in the available options
+def get_closest_strike(available_strikes, target_strike):
+    available_strikes = np.array(available_strikes)
+    index = (np.abs(available_strikes - target_strike)).argmin()
+    return available_strikes[index]
+
+# Function to determine the spread strikes
+def determine_spread_strikes(puts, calls, current_price, strategy='bull'):
+    if strategy == 'bull':
+        desired_upper_strike_put = np.round(current_price * 0.95)
+        desired_lower_strike_put = np.round(current_price * 0.75)
+        upper_strike_put = get_closest_strike(puts['strike'], desired_upper_strike_put)
+        lower_strike_put = get_closest_strike(puts['strike'], desired_lower_strike_put)
+        return upper_strike_put, lower_strike_put
+    else:
+        desired_lower_strike_call = np.round(current_price * 1.05)
+        desired_higher_strike_call = np.round(current_price * 1.10)
+        lower_strike_call = get_closest_strike(calls['strike'], desired_lower_strike_call)
+        higher_strike_call = get_closest_strike(calls['strike'], desired_higher_strike_call)
+        return lower_strike_call, higher_strike_call
+
+# Download historical data for SPY
+data = yf.download('SPY', start='2020-01-01', end='2023-11-01')
+
+# Calculate moving averages
+calculate_moving_averages(data, 5, 20)
+
+# Fetch the SPY ticker
+ticker = yf.Ticker('SPY')
+
+# Placeholder for risk-free rate and volatility
+risk_free_rate = 0.01  # 1% annual risk-free rate
+volatility = 0.2  # 20% annual volatility
+
+# Initialize lists to store credits and dates
+credits_put = []
+credits_call = []
+dates = []
+
+# Loop through the data and apply the strategies
+for i in range(1, len(data)):
+    current_price = data['Close'].iloc[i]
+    expiration_date = determine_expiration_date(ticker)
+    time_to_expiration = (datetime.strptime(expiration_date, '%Y-%m-%d') - datetime.utcnow()).days / 365.0
+
+    # Determine the strikes for the spreads
+    options = ticker.option_chain(expiration_date)
+    puts = options.puts
+    calls = options.calls
+
+    if data['5_MA'].iloc[i] > data['20_MA'].iloc[i] and data['5_MA'].iloc[i - 1] <= data['20_MA'].iloc[i - 1]:
+        # Bull Put Spread logic
+        upper_strike_put, lower_strike_put = determine_spread_strikes(puts, calls, current_price, 'bull')
+
+        # Calculate theoretical prices for the selected put strikes
+        theoretical_sell_put_price = black_scholes(
+            S=current_price,
+            K=upper_strike_put,
+            T=time_to_expiration,
+            r=risk_free_rate,
+            sigma=volatility,
+            option_type='put'
+        )
+        
+        theoretical_buy_put_price = black_scholes(
+            S=current_price,
+            K=lower_strike_put,
+            T=time_to_expiration,
+            r=risk_free_rate,
+            sigma=volatility,
+            option_type='put'
+        )
+
+        # Calculate the spread credit
+        credit_put = theoretical_sell_put_price - theoretical_buy_put_price
+        credits_put.append(credit_put)
+        dates.append(data.index[i])
+        print(f"Bull Put Spread entered on {data.index[i]}. Theoretical Credit received: {credit_put}")
+
+    elif data['5_MA'].iloc[i] < data['20_MA'].iloc[i] and data['5_MA'].iloc[i - 1] >= data['20_MA'].iloc[i - 1]:
+        # Bear Call Spread logic
+        lower_strike_call, higher_strike_call = determine_spread_strikes(puts, calls, current_price, 'bear')
+
+        # Calculate theoretical prices for the selected call strikes
+        theoretical_sell_call_price = black_scholes(
+            S=current_price,
+            K=lower_strike_call,
+            T=time_to_expiration,
+            r=risk_free_rate,
+            sigma=volatility,
+            option_type='call'
+        )
+        
+        theoretical_buy_call_price = black_scholes(
+            S=current_price,
+            K=higher_strike_call,
+            T=time_to_expiration,
+            r=risk_free_rate,
+            sigma=volatility,
+            option_type='call'
+        )
+
+        # Calculate the spread credit
+        credit_call = theoretical_sell_call_price - theoretical_buy_call_price
+        credits_call.append(credit_call)
+        dates.append(data.index[i])
+        print(f"Bear Call Spread entered on {data.index[i]}. Theoretical Credit received: {credit_call}")
+
+# Convert credits to cumulative PnL
+multiplier=100
+cumulative_pnl_put = np.cumsum(credits_put)*multiplier
+cumulative_pnl_call = np.cumsum(credits_call)*multiplier
+
+# Plot the PnL
+plt.figure(figsize=(14, 7))
+
+# Plot put credits if there are any
+if credits_put:
+    plt.plot(dates[:len(cumulative_pnl_put)], cumulative_pnl_put, label='Cumulative PnL from Put Spreads', marker='o')
+
+# Plot call credits if there are any
+if credits_call:
+    plt.plot(dates[:len(cumulative_pnl_call)], cumulative_pnl_call, label='Cumulative PnL from Call Spreads', marker='x')
+
+# Check if there are any credits, then plot
+if credits_put or credits_call:
+    plt.figure(figsize=(14, 7))
+    
+    if credits_put:
+        plt.plot(dates[:len(cumulative_pnl_put)], cumulative_pnl_put, label='Cumulative PnL from Put Spreads', marker='o')
+
+    if credits_call:
+        plt.plot(dates[:len(cumulative_pnl_call)], cumulative_pnl_call, label='Cumulative PnL from Call Spreads', marker='o')
+    
+    plt.xlabel('Date')
+    plt.ylabel('PnL ($)')
+    plt.title('Cumulative PnL from Option Spreads')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
